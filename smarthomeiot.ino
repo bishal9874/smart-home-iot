@@ -1,50 +1,147 @@
-const int trigPin = 19;    // GPIO pin connected to Ultrasonic Trigger pin
-const int echoPin = 21;     // GPIO pin connected to Ultrasonic Echo pin
-const int ledPin = 18;     // GPIO pin connected to LED
-const int ledOnTime = 10000; // Time LED stays on after detection (in milliseconds)
-const float maxDistance = 20.0; // Max detection distance in cm (4 feet ≈ 122 cm)
+#include <ESP8266WiFi.h>
+#include <Firebase_ESP_Client.h>
 
-unsigned long motionDetectedTime = 0; // Time when object was last detected
-bool ledOn = false;       // LED state
+// WiFi credentials
+#define WIFI_SSID "illusion"
+#define WIFI_PASSWORD "12345678"
+
+// Firebase credentials
+#define API_KEY "AIzaSyAAINNRbth3fbAwXBsxR0NL1AmnWRskKy8"
+#define DATABASE_URL "https://smart-home-75464-default-rtdb.firebaseio.com/"
+#define USER_EMAIL "femaleaura865@gmail.com"
+#define USER_PASSWORD "Female906@"
+#define USER_ID "sRWqDuVfO1bvEPwSipuKhSgcNOI2"
+
+// Pin assignments for NodeMCU
+const int trigPin = 14; // D5
+const int echoPin = 12; // D6
+const int ledPin = 4;   // D2
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Firebase paths
+String basePath = "/users/" + String(USER_ID);
+String autoModePath = basePath + "/autoModes/auto1";
+String lightStatePath = basePath + "/lightStates/light1";
+String distancePath = basePath + "/distances/measureDistance";
+String maxDistancePath = basePath + "/distances/distance1";
+
+// Logic variables
+unsigned long motionDetectedTime = 0;
+unsigned long lastUpdateTime = 0;
+const unsigned long interval = 1000;
+const int ledOnTime = 10000;
+bool ledOn = false;
+bool autoMode = false;
+float maxDistance; // default fallback
 
 void setup() {
-  pinMode(trigPin, OUTPUT); // Set Trigger pin as output
-  pinMode(echoPin, INPUT);  // Set Echo pin as input
-  pinMode(ledPin, OUTPUT);  // Set LED pin as output
-  digitalWrite(ledPin, LOW); // Ensure LED is off initially
-  Serial.begin(115200);     // Start serial communication for debugging
+  Serial.begin(115200);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  connectToWiFi();
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectNetwork(true);
 }
 
 void loop() {
-  // Send 10µs pulse to Trigger pin
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+  }
+
+  if (Firebase.ready() && millis() - lastUpdateTime > interval) {
+    lastUpdateTime = millis();
+
+    // --- Read autoMode from Firebase
+    if (Firebase.RTDB.getBool(&fbdo, autoModePath.c_str())) {
+      autoMode = fbdo.boolData();
+    }
+
+    // --- Read maxDistance from Firebase
+    if (Firebase.RTDB.getFloat(&fbdo, maxDistancePath.c_str())) {
+      maxDistance = fbdo.floatData();
+    }
+
+    if (autoMode) {
+      // --- Auto Mode: Read distance from sensor
+      float distance = measureDistance();
+      if (distance > 0) {
+        Serial.printf("Measured: %.2f cm\n", distance);
+
+        // Update distance to Firebase
+        Firebase.RTDB.setFloat(&fbdo, distancePath.c_str(), distance);
+
+        if (distance <= maxDistance) {
+          digitalWrite(ledPin, HIGH);
+          ledOn = true;
+          motionDetectedTime = millis();
+        }
+      }
+
+      // Turn off LED after timeout
+      if (ledOn && millis() - motionDetectedTime >= ledOnTime) {
+        digitalWrite(ledPin, LOW);
+        ledOn = false;
+        Serial.println("LED turned off due to timeout.");
+      }
+
+    } else {
+      // --- Manual Mode
+      if (Firebase.RTDB.getBool(&fbdo, lightStatePath.c_str())) {
+        bool lightState = fbdo.boolData();
+        digitalWrite(ledPin, lightState);
+        ledOn = lightState;
+        Serial.printf("Manual LED: %s\n", lightState ? "ON" : "OFF");
+      }
+    }
+
+    // --- Status Print
+    Serial.println("--- STATUS ---");
+    Serial.printf("Auto Mode: %s\n", autoMode ? "ON" : "OFF");
+    Serial.printf("LED: %s\n", digitalRead(ledPin) ? "ON" : "OFF");
+    Serial.printf("maxDistance: %.2f cm\n", maxDistance);
+    Serial.println("---------------");
+  }
+}
+
+float measureDistance() {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  // Measure duration of Echo pulse
-  long duration = pulseIn(echoPin, HIGH);
+  long duration = pulseIn(echoPin, HIGH, 30000); // timeout 30ms
+  if (duration == 0) return -1;
+  float dist = duration * 0.0343 / 2;
+  if (dist <= 0 || dist > 400) return -1;
+  return dist;
+}
 
-  // Calculate distance in cm (speed of sound = 0.0343 cm/µs, divide by 2 for round trip)
-  float distance = duration * 0.0343 / 2;
-
-  // Check if object is within 4 feet
-  if (distance <= maxDistance && distance > 0) {
-    Serial.print("Object detected at ");
-    Serial.print(distance);
-    Serial.println(" cm");
-    digitalWrite(ledPin, HIGH); // Turn on LED
-    ledOn = true;
-    motionDetectedTime = millis(); // Record time of detection
+void connectToWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    Serial.print(".");
+    delay(300);
   }
 
-  // Turn off LED after ledOnTime if no new detection
-  if (ledOn && (millis() - motionDetectedTime >= ledOnTime)) {
-    digitalWrite(ledPin, LOW); // Turn off LED
-    ledOn = false;
-    Serial.println("LED turned off.");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected, IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWi-Fi connection failed.");
   }
-
-  delay(100); // Small delay to prevent excessive loop speed
 }
